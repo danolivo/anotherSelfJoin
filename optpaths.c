@@ -110,11 +110,11 @@ OnNegativeExit:
 	return false;
 }
 
-struct
+typedef struct
 {
 	int oldvarno;
 	int newvarno;
-} context;
+} tlist_vars_replace;
 
 static void
 join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
@@ -123,6 +123,8 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	ListCell	*lc;
 	WalkerHook data;
 	List *childs = NIL;
+	JoinPath *jp = NULL;
+	tlist_vars_replace context;
 
 	data.result = true;
 	data.root = root;
@@ -153,12 +155,13 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 
 	/* Now self join type has proved */
 
+	Assert(list_length(joinrel->pathlist) > 0);
 	foreach(lc, joinrel->pathlist)
 	{
 		if (IsA(lfirst(lc), NestPath) || IsA(lfirst(lc), MergePath) ||
 			IsA(lfirst(lc), HashPath))
 		{
-			JoinPath *jp = (JoinPath *) lfirst(lc);
+			jp = (JoinPath *) lfirst(lc);
 
 			Assert(jp->innerjoinpath != NULL && jp->outerjoinpath != NULL);
 			childs = lappend(childs, jp->innerjoinpath);
@@ -176,7 +179,11 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		return;
 
 	add_path(joinrel, (Path *) create_sj_path(root, joinrel, childs));
-	replace_outer_refs(joinrel->reltarget->exprs, replace_outer_refs, &context);
+
+	context.oldvarno = outerrel->relid;
+	context.newvarno = innerrel->relid;
+	elog(INFO, "--> Replace %d with %d", context.oldvarno, context.newvarno);
+	replace_outer_refs((Node *) joinrel->reltarget->exprs, &context);
 }
 
 static Node *
@@ -184,6 +191,14 @@ replace_outer_refs(Node *node, void *context)
 {
 	if (node == NULL)
 		return NULL;
+	if (IsA(node, Var))
+	{
+		Var *var = (Var *) node;
+		tlist_vars_replace *ctx = (tlist_vars_replace *) context;
+
+		if (var->varno == ctx->oldvarno)
+			var->varno = ctx->newvarno;
+	}
 
 	return expression_tree_mutator(node, replace_outer_refs, context);
 }
