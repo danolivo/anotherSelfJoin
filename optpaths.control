@@ -1,0 +1,5 @@
+# Additional planner paths extension
+comment = 'Additional planner paths extension'
+default_version = '0.1'
+module_pathname = '$libdir/optpaths'
+relocatable = false
