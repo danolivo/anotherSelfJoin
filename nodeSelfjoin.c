@@ -58,9 +58,10 @@ BeginSelfJoin(CustomScanState *node, EState *estate, int eflags)
 	/*
 	 * Initialize result slot, type and projection.
 	 */
-//	ExecInitResultTupleSlotTL(&node->ss.ps, &TTSOpsVirtual);
-//	ExecAssignProjectionInfo(&node->ss.ps, NULL);
-
+	ExecInitScanTupleSlot(estate, &node->ss, planState->ps_ResultTupleDesc,
+															planState->scanops);
+	ExecConditionalAssignProjectionInfo(&node->ss.ps,
+									planState->ps_ResultTupleDesc, INDEX_VAR);
 	return;
 }
 
@@ -71,6 +72,8 @@ ExecSelfJoin(CustomScanState *node)
 	ExprContext *econtext;
 
 	econtext = node->ss.ps.ps_ExprContext;
+
+	ResetExprContext(econtext);
 	econtext->ecxt_scantuple = ExecProcNode(&subPlanState->ps);
 
 	if (TupIsNull(econtext->ecxt_scantuple))

@@ -6,6 +6,7 @@
 #include "nodes/nodes.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
 
 #include "nodeSelfjoin.h"
@@ -13,7 +14,8 @@
 
 PG_MODULE_MAGIC;
 
-static set_join_pathlist_hook_type prev_join_pathlist_hook = NULL;
+static set_join_pathlist_hook_type	prev_join_pathlist_hook = NULL;
+static create_upper_paths_hook_type	prev_create_upper_paths_hook = NULL;
 
 
 void _PG_init(void);
@@ -21,7 +23,9 @@ static bool walker(Node *node, void *context);
 static void join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel,
 								RelOptInfo *outerrel, RelOptInfo *innerrel,
 								JoinType jointype, JoinPathExtraData *extra);
-static Node *replace_outer_refs(Node *node, void *context);
+static bool replace_outer_refs(Node *node, void *context);
+static void create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+					RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra);
 
 
 void
@@ -30,6 +34,8 @@ _PG_init(void)
 	SelfJoin_Init_methods();
 	prev_join_pathlist_hook = set_join_pathlist_hook;
 	set_join_pathlist_hook = join_pathlist_hook;
+	prev_create_upper_paths_hook = create_upper_paths_hook;
+	create_upper_paths_hook = create_upper_paths;
 }
 
 typedef struct
@@ -39,28 +45,6 @@ typedef struct
 	RelOptInfo *rel;
 	RelOptInfo *innerrel;
 } WalkerHook;
-
-static void
-set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel)
-{
-	Relids		required_outer;
-
-	/*
-	 * We don't support pushing join clauses into the quals of a seqscan, but
-	 * it could still have required parameterization due to LATERAL refs in
-	 * its tlist.
-	 */
-	required_outer = rel->lateral_relids;
-
-	/* Consider sequential scan */
-	add_path(rel, create_seqscan_path(root, rel, required_outer, 0));
-
-	/* Consider index scans */
-	create_index_paths(root, rel);
-
-	/* Consider TID scans */
-	create_tidscan_paths(root, rel);
-}
 
 static bool
 walker(Node *node, void *context)
@@ -112,8 +96,8 @@ OnNegativeExit:
 
 typedef struct
 {
-	int oldvarno;
-	int newvarno;
+	Index oldvarno;
+	Index newvarno;
 } tlist_vars_replace;
 
 static void
@@ -158,6 +142,12 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	Assert(list_length(joinrel->pathlist) > 0);
 	foreach(lc, joinrel->pathlist)
 	{
+		if (IsA(lfirst(lc), CustomPath))
+			return;
+	}
+
+	foreach(lc, joinrel->pathlist)
+	{
 		if (IsA(lfirst(lc), NestPath) || IsA(lfirst(lc), MergePath) ||
 			IsA(lfirst(lc), HashPath))
 		{
@@ -175,18 +165,17 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	/*
 	 * Path list contains only self join scans.
 	 */
-	if (childs == NULL)
+	if (childs == NIL)
 		return;
-
-	add_path(joinrel, (Path *) create_sj_path(root, joinrel, childs));
 
 	context.oldvarno = outerrel->relid;
 	context.newvarno = innerrel->relid;
 	elog(INFO, "--> Replace %d with %d", context.oldvarno, context.newvarno);
 	replace_outer_refs((Node *) joinrel->reltarget->exprs, &context);
+	add_path(joinrel, (Path *) create_sj_path(root, joinrel, childs));
 }
 
-static Node *
+static bool
 replace_outer_refs(Node *node, void *context)
 {
 	if (node == NULL)
@@ -200,5 +189,33 @@ replace_outer_refs(Node *node, void *context)
 			var->varno = ctx->newvarno;
 	}
 
-	return expression_tree_mutator(node, replace_outer_refs, context);
+	return expression_tree_walker(node, replace_outer_refs, context);
+}
+
+static void create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+					RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra)
+{
+	ListCell *lc;
+
+	foreach (lc, output_rel->pathlist)
+	{
+		ProjectionPath *pj;
+		Path *ipath, *opath;
+		tlist_vars_replace context;
+
+		if (!IsA((Node *) lfirst(lc), ProjectionPath))
+			continue;
+
+		pj = (ProjectionPath *) lfirst(lc);
+
+		if (!IsA((Node *) pj->subpath, CustomPath))
+			continue;
+
+		Assert(((CustomPath *) pj->subpath)->custom_paths != NIL);
+		opath = (Path *) lsecond(((CustomPath *) pj->subpath)->custom_paths);
+		ipath = (Path *) linitial(((CustomPath *) pj->subpath)->custom_paths);
+		context.oldvarno = opath->parent->relid;
+		context.newvarno = ipath->parent->relid;
+		replace_outer_refs((Node *) pj->path.pathtarget->exprs, &context);
+	}
 }
