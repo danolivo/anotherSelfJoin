@@ -8,6 +8,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
+#include "utils/guc.h"
 
 #include "nodeSelfjoin.h"
 
@@ -16,6 +17,10 @@ PG_MODULE_MAGIC;
 
 static set_join_pathlist_hook_type	prev_join_pathlist_hook = NULL;
 static create_upper_paths_hook_type	prev_create_upper_paths_hook = NULL;
+
+/* GUC for debug and test purposes */
+static bool remove_self_join = true;
+static int log_level = DEBUG1;
 
 
 void _PG_init(void);
@@ -31,6 +36,17 @@ static void create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 void
 _PG_init(void)
 {
+	DefineCustomBoolVariable("remove_self_joins",
+							 "Turn on/off Self Joins removal",
+							 NULL,
+							 &remove_self_join,
+							 true,
+							 PGC_SIGHUP,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	SelfJoin_Init_methods();
 	prev_join_pathlist_hook = set_join_pathlist_hook;
 	set_join_pathlist_hook = join_pathlist_hook;
@@ -42,8 +58,6 @@ typedef struct
 {
 	bool result;
 	PlannerInfo *root;
-	RelOptInfo *rel;
-	RelOptInfo *innerrel;
 } WalkerHook;
 
 static bool
@@ -75,7 +89,6 @@ walker(Node *node, void *context)
 		Assert(rvar->varno != INNER_VAR && rvar->varno != OUTER_VAR &&
 													rvar->varno != INDEX_VAR);
 
-		elog(INFO, " --> %u %u <--",root->simple_rte_array[lvar->varno]->relid, root->simple_rte_array[rvar->varno]->relid);
 		if (root->simple_rte_array[lvar->varno]->relid !=
 			root->simple_rte_array[rvar->varno]->relid ||
 			lvar->varattno != rvar->varattno)
@@ -110,20 +123,28 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	JoinPath *jp = NULL;
 	tlist_vars_replace context;
 
+	if (!remove_self_join)
+		return;
+
 	data.result = true;
 	data.root = root;
-	data.rel = joinrel;
-	data.innerrel = innerrel;
 
 	if (prev_join_pathlist_hook)
 		prev_join_pathlist_hook(root, joinrel, outerrel, innerrel, jointype, extra);
 
 	if (innerrel->reloptkind != RELOPT_BASEREL ||
 		outerrel->reloptkind != RELOPT_BASEREL)
+	{
+		elog(log_level, "Join can't be removed: inner or outer relation is not base relation: %d %d",
+				innerrel->reloptkind, outerrel->reloptkind);
 		return;
+	}
 
 	if (!extra->inner_unique)
+	{
+		elog(log_level, "Join can't be removed: inner relation is not unique");
 		return;
+	}
 
 	/*
 	 * Pass the join restrictions and check clauses for compliance with
@@ -135,7 +156,10 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		walker((Node *) rinfo->clause, (void *) &data);
 	}
 	if (!data.result)
+	{
+		elog(log_level, "Join can't be removed: clause can't pass verification");
 		return;
+	}
 
 	/* Now self join type has proved */
 
@@ -154,8 +178,8 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 			jp = (JoinPath *) lfirst(lc);
 
 			Assert(jp->innerjoinpath != NULL && jp->outerjoinpath != NULL);
-			childs = lappend(childs, jp->innerjoinpath);
 			childs = lappend(childs, jp->outerjoinpath);
+			childs = lappend(childs, jp->innerjoinpath);
 			break;
 		}
 
@@ -168,10 +192,43 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	if (childs == NIL)
 		return;
 
-	context.oldvarno = outerrel->relid;
-	context.newvarno = innerrel->relid;
-	elog(INFO, "--> Replace %d with %d", context.oldvarno, context.newvarno);
+	context.oldvarno = innerrel->relid;
+	context.newvarno = outerrel->relid;
+	elog(log_level, "Replace varno %d with %d", context.oldvarno, context.newvarno);
+
+	foreach(lc, innerrel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) copyObject(lfirst(lc));
+
+		Assert(bms_is_member(context.oldvarno, rinfo->clause_relids));
+		Assert(bms_is_empty(rinfo->nullable_relids));
+		Assert(bms_is_empty(rinfo->outer_relids));
+
+		Assert(bms_is_member(context.oldvarno, rinfo->left_relids));
+		if (bms_is_member(context.oldvarno, rinfo->left_relids))
+		{
+			rinfo->left_relids = bms_del_member(rinfo->left_relids, context.oldvarno);
+			rinfo->left_relids = bms_add_member(rinfo->left_relids, context.newvarno);
+		}
+
+		Assert(bms_is_empty(rinfo->right_relids));
+		Assert(rinfo->orclause == NULL);
+
+		bms_del_member(rinfo->clause_relids, context.oldvarno);
+		bms_add_member(rinfo->clause_relids, context.newvarno);
+		if (bms_is_member(context.oldvarno, rinfo->required_relids))
+		{
+			rinfo->required_relids = bms_del_member(rinfo->required_relids, context.oldvarno);
+			rinfo->required_relids = bms_add_member(rinfo->required_relids, context.newvarno);
+		}
+
+		replace_outer_refs((Node *) rinfo->clause, &context);
+		outerrel->baserestrictinfo = lappend(outerrel->baserestrictinfo, rinfo);
+	}
+
+	outerrel->reltarget->exprs = list_concat_copy(innerrel->reltarget->exprs, outerrel->reltarget->exprs);
 	replace_outer_refs((Node *) joinrel->reltarget->exprs, &context);
+	replace_outer_refs((Node *) outerrel->reltarget->exprs, &context);
 	add_path(joinrel, (Path *) create_sj_path(root, joinrel, childs));
 }
 
@@ -196,6 +253,9 @@ static void create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra)
 {
 	ListCell *lc;
+
+	if (!remove_self_join)
+		return;
 
 	foreach (lc, output_rel->pathlist)
 	{

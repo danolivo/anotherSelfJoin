@@ -9,6 +9,7 @@
 #include "nodeSelfjoin.h"
 #include "nodes/pg_list.h"
 #include "nodes/nodes.h"
+#include "optimizer/cost.h"
 
 
 static CustomPathMethods	SJ_Path_methods;
@@ -32,9 +33,6 @@ CreateSelfJoinState(CustomScan *node)
 	state = (CustomScanState *) palloc0(sizeof(CustomScanState));
 	NodeSetTag(state, T_CustomScanState);
 
-	if (node->scan.scanrelid > 0)
-		node->scan.scanrelid = 0;
-
 	state->flags = node->flags;
 	state->methods = &SJ_Exec_methods;
 	state->custom_ps = NIL;
@@ -49,7 +47,7 @@ BeginSelfJoin(CustomScanState *node, EState *estate, int eflags)
 	Plan		*scan_plan;
 	PlanState	*planState;
 
-	/* At this moment we need only inner scan */
+	/* At this moment we need only outer scan */
 	Assert(list_length(cscan->custom_plans) == 1);
 	scan_plan = (Plan *) linitial(cscan->custom_plans);
 	planState = (PlanState *) ExecInitNode(scan_plan, estate, eflags);
@@ -155,13 +153,9 @@ make_sj(List *custom_plans, List *tlist)
 	node->methods = &SJ_Plan_methods;
 	node->scan.scanrelid = 0;
 	node->custom_plans = lappend(NIL, subplan);
-	elog(INFO, "--> LIST len: %d", list_length(tlist));
 	node->custom_scan_tlist = copyObject(subplan->targetlist);
 	node->custom_exprs = NIL;
 	node->custom_private = NIL;
-
-	if (tlist == NIL)
-		node->scan.scanrelid = ((Scan *) linitial(custom_plans))->scanrelid;
 
 	return node;
 }
@@ -191,8 +185,6 @@ SJCreateCustomPlan(PlannerInfo *root,
 	return &sj->scan.plan;
 }
 
-
-#include "optimizer/cost.h"
 #define cstmSubPath1(customPath) (Path *) linitial(((CustomPath *) \
 													customPath)->custom_paths)
 
