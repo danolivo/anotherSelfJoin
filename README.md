@@ -5,17 +5,17 @@ Remove Self Joins extension for PostgreSQL
 **Query:**
 
 ```SQL
-CREATE TABLE tt(a INT PRIMARY KEY, b TEXT);`
-`explain SELECT p.* FROM tt AS p JOIN (SELECT * FROM tt WHERE b ~~ 'a%') AS q ON p.a = q.a;
+CREATE TABLE tt(a INT PRIMARY KEY, b TEXT);
+explain SELECT p.* FROM tt AS p JOIN (SELECT * FROM tt WHERE b ~~ 'a%') AS q ON p.a = q.a;
 ```
 **Non-optimized plan:**
-                                QUERY PLAN                                 
----------------------------------------------------------------------------
- Nested Loop  (cost=0.15..50.90 rows=6 width=36)
-   ->  Seq Scan on tt  (cost=0.00..25.88 rows=6 width=4)
-         Filter: (b ~~ 'a%'::text)
-   ->  Index Scan using tt_pkey on tt p  (cost=0.15..4.17 rows=1 width=36)
-         Index Cond: (a = tt.a)
+>                                QUERY PLAN                                 
+>---------------------------------------------------------------------------
+> Nested Loop  (cost=0.15..50.90 rows=6 width=36)
+>   ->  Seq Scan on tt  (cost=0.00..25.88 rows=6 width=4)
+>         Filter: (b ~~ 'a%'::text)
+>   ->  Index Scan using tt_pkey on tt p  (cost=0.15..4.17 rows=1 width=36)
+>         Index Cond: (a = tt.a)
 
 **Plan with removed self join:**
                        QUERY PLAN
