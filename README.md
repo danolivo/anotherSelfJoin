@@ -3,7 +3,9 @@ Remove Self Joins extension for PostgreSQL
 
 ## Example
 *Query:*
+
 CREATE TABLE tt(a INT PRIMARY KEY, b TEXT);
+
 explain SELECT p.* FROM tt AS p JOIN (SELECT * FROM tt WHERE b ~~ 'a%') AS q ON p.a = q.a;
 
 ### Non-optimized plan:
