@@ -16,12 +16,19 @@
 PG_MODULE_MAGIC;
 
 static set_join_pathlist_hook_type	prev_join_pathlist_hook = NULL;
-static create_upper_paths_hook_type	prev_create_upper_paths_hook = NULL;
+//static create_upper_paths_hook_type	prev_create_upper_paths_hook = NULL;
 
 /* GUC for debug and test purposes */
-static bool remove_self_join = true;
-static int log_level = DEBUG1;
+static bool remove_self_joins = true;
+static int log_level;
 
+/* GUC variables */
+static const struct config_enum_entry format_options[] = {
+	{"debug1", DEBUG1, false},
+	{"info", INFO, false},
+	{"log", LOG, false},
+	{NULL, 0, false}
+};
 
 void _PG_init(void);
 static bool walker(Node *node, void *context);
@@ -29,8 +36,8 @@ static void join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel,
 								RelOptInfo *outerrel, RelOptInfo *innerrel,
 								JoinType jointype, JoinPathExtraData *extra);
 static bool replace_outer_refs(Node *node, void *context);
-static void create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
-					RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra);
+//static void create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+//					RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra);
 
 
 void
@@ -39,10 +46,22 @@ _PG_init(void)
 	DefineCustomBoolVariable("remove_self_joins",
 							 "Turn on/off Self Joins removal",
 							 NULL,
-							 &remove_self_join,
+							 &remove_self_joins,
 							 true,
-							 PGC_SIGHUP,
+							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomEnumVariable("log_level",
+							 "Log level for Self Joins extension",
+							 NULL,
+							 &log_level,
+							 DEBUG1,
+							 format_options,
+							 PGC_USERSET,
+							 0,
 							 NULL,
 							 NULL,
 							 NULL);
@@ -50,8 +69,8 @@ _PG_init(void)
 	SelfJoin_Init_methods();
 	prev_join_pathlist_hook = set_join_pathlist_hook;
 	set_join_pathlist_hook = join_pathlist_hook;
-	prev_create_upper_paths_hook = create_upper_paths_hook;
-	create_upper_paths_hook = create_upper_paths;
+/*	prev_create_upper_paths_hook = create_upper_paths_hook;
+	create_upper_paths_hook = create_upper_paths; */
 }
 
 typedef struct
@@ -100,8 +119,8 @@ walker(Node *node, void *context)
 	/* Should not find an unplanned subquery */
 	Assert(!IsA(node, Query));
 
-	return expression_tree_walker(node, walker,
-								  (void *) context);
+	return expression_tree_walker(node, walker, (void *) context);
+
 OnNegativeExit:
 	data->result = false;
 	return false;
@@ -123,7 +142,7 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	JoinPath *jp = NULL;
 	tlist_vars_replace context;
 
-	if (!remove_self_join)
+	if (!remove_self_joins)
 		return;
 
 	data.result = true;
@@ -170,6 +189,7 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 			return;
 	}
 
+	/* XXX partial_pathlist */
 	foreach(lc, joinrel->pathlist)
 	{
 		if (IsA(lfirst(lc), NestPath) || IsA(lfirst(lc), MergePath) ||
@@ -225,10 +245,20 @@ join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		replace_outer_refs((Node *) rinfo->clause, &context);
 		outerrel->baserestrictinfo = lappend(outerrel->baserestrictinfo, rinfo);
 	}
-
+/*
+	foreach (lc, root->rowMarks)
+	{
+		PlanRowMark *rowMark = (PlanRowMark *) lfirst(lc);
+		elog(INFO, "ROWMARK: rti=%d", rowMark->rti);
+		if (rowMark->rti == context.oldvarno)
+			rowMark->rti = context.newvarno;
+	}
+*/
 	outerrel->reltarget->exprs = list_concat_copy(innerrel->reltarget->exprs, outerrel->reltarget->exprs);
 	replace_outer_refs((Node *) joinrel->reltarget->exprs, &context);
 	replace_outer_refs((Node *) outerrel->reltarget->exprs, &context);
+	replace_outer_refs((Node *) root->processed_tlist, &context);
+
 	add_path(joinrel, (Path *) create_sj_path(root, joinrel, childs));
 }
 
@@ -236,7 +266,8 @@ static bool
 replace_outer_refs(Node *node, void *context)
 {
 	if (node == NULL)
-		return NULL;
+		return false;
+
 	if (IsA(node, Var))
 	{
 		Var *var = (Var *) node;
@@ -248,34 +279,40 @@ replace_outer_refs(Node *node, void *context)
 
 	return expression_tree_walker(node, replace_outer_refs, context);
 }
+/*
+#include "path_walker.h"
+
+static bool fix_pathlist_replacements(Path *path, void *context)
+{
+	if (IsA(path, CustomPath))
+	{
+		Path *ipath, *opath;
+		tlist_vars_replace context;
+
+		Assert(((CustomPath *) path)->custom_paths != NIL);
+
+		ipath = (Path *) linitial(((CustomPath *) path)->custom_paths);
+		opath = (Path *) lsecond(((CustomPath *) path)->custom_paths);
+		context.newvarno = ipath->parent->relid;
+		context.oldvarno = opath->parent->relid;
+		replace_outer_refs((Node *) path->pathtarget->exprs, &context);
+	}
+
+	return path_tree_walker(path, fix_pathlist_replacements, NULL);
+}
 
 static void create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra)
 {
 	ListCell *lc;
 
-	if (!remove_self_join)
+	if (!remove_self_joins)
 		return;
 
 	foreach (lc, output_rel->pathlist)
 	{
-		ProjectionPath *pj;
-		Path *ipath, *opath;
-		tlist_vars_replace context;
+		Path *path = (Path *) lfirst(lc);
 
-		if (!IsA((Node *) lfirst(lc), ProjectionPath))
-			continue;
-
-		pj = (ProjectionPath *) lfirst(lc);
-
-		if (!IsA((Node *) pj->subpath, CustomPath))
-			continue;
-
-		Assert(((CustomPath *) pj->subpath)->custom_paths != NIL);
-		opath = (Path *) lsecond(((CustomPath *) pj->subpath)->custom_paths);
-		ipath = (Path *) linitial(((CustomPath *) pj->subpath)->custom_paths);
-		context.oldvarno = opath->parent->relid;
-		context.newvarno = ipath->parent->relid;
-		replace_outer_refs((Node *) pj->path.pathtarget->exprs, &context);
+		fix_pathlist_replacements(path, NULL);
 	}
-}
+} */

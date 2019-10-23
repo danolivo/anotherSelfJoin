@@ -4,7 +4,7 @@ EXTENSION = optpaths
 EXTVERSION = 0.1
 PGFILEDESC = "Additional paths"
 MODULES = optpaths
-OBJS = nodeSelfjoin.o optpaths.o $(WIN32RES)
+OBJS = nodeSelfjoin.o optpaths.o path_walker.o $(WIN32RES)
 
 DATA = optpaths--0.1.sql
 #DATA_built = optpaths--0.1.sql
