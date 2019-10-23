@@ -19,11 +19,12 @@ explain SELECT p.* FROM tt AS p JOIN (SELECT * FROM tt WHERE b ~~ 'a%') AS q ON 
          Index Cond: (a = tt.a)
 ```
 **Plan with removed self join:**
+```
                        QUERY PLAN
 ──────────────────────────────────────────────────────
   Seq Scan on tt p  (cost=0.00..25.88 rows=6 width=36)
     Filter: (b ~~ 'a%'::text)
-    
+``` 
 ## Objectives
 We want to replace some types of join of relation with itself by one scan.
 
